@@ -50,40 +50,48 @@ G_DEFINE_TYPE (FpDeviceCs9711, fpi_device_cs9711, FP_TYPE_IMAGE_DEVICE)
 
 /************************** GENERIC STUFF *************************************/
 
-/** If error isn't NULL then fail the ssm or move it to the next state */
+/** Asynchroneous USB bulk write OUT helper, user_data of the callback is the command type.
+ *  Synchronous transfers spin a nested main loop in GUsb and cannot be cancelled,
+ *  which left the device stuck when an operation was cancelled while one was running.
+ *  Commands are not cancellable themselves: aborting one midway left the reader
+ *  without ever sending an image again. They are short and time out anyway, only
+ *  the reads are cancelled. */
 static void
-m_util_fail_if_error_or_next (FpiSsm *ssm, GError *error)
+usb_send_out (FpDevice *dev,
+              FpiSsm *ssm,
+              guint8 type,
+              FpiUsbTransferCallback callback)
 {
-  if (error)
-    fpi_ssm_mark_failed (ssm, error);
-  else
-    fpi_ssm_next_state (ssm);
-}
-
-/** Synchroneous USB bulk write OUT helper*/
-static void
-usb_send_out_sync (FpDevice *dev, guint8 type, GError **error)
-{
-  GError *err = NULL;
-
+  FpiUsbTransfer *transfer = NULL;
   guint8 *data = g_malloc0(CS9711_FP_CMD_LEN_1);
 
   data[0] = data[CS9711_FP_CMD_LEN_1 - 1] = 0xEA;
   data[1] = data[CS9711_FP_CMD_LEN_1 - 2] = type;
 
-  g_autoptr(FpiUsbTransfer) transfer = NULL;
-
   transfer = fpi_usb_transfer_new (FP_DEVICE (dev));
   transfer->short_is_error = FALSE;
+  transfer->ssm = ssm;
   fpi_usb_transfer_fill_bulk_full (transfer, CS9711_SEND_ENDPOINT, (guint8 *) data, CS9711_FP_CMD_LEN_1, g_free);
-  fpi_usb_transfer_submit_sync (transfer, CS9711_DEFAULT_WAIT_TIMEOUT, &err);
-  if (err)
+  fpi_usb_transfer_submit (transfer, CS9711_DEFAULT_WAIT_TIMEOUT, NULL, callback, GUINT_TO_POINTER (type));
+}
+
+/** Send callback: fail the ssm on error or move it to the next state */
+static void
+m_util_send_cb_fail_or_next (FpiUsbTransfer *transfer,
+                             FpDevice       *dev,
+                             gpointer        user_data_is_type,
+                             GError         *error)
+{
+  if (error)
     {
-      g_warning ("Error while sending command 0x%X, continuing anyway: %s", type, err->message);
-      g_propagate_error (error, err);
+      g_warning ("Error while sending command 0x%X: %s", GPOINTER_TO_UINT (user_data_is_type), error->message);
+      fpi_ssm_mark_failed (transfer->ssm, error);
     }
   else
-    fp_dbg("Sent command 0x%X", type);
+    {
+      fp_dbg("Sent command 0x%X", GPOINTER_TO_UINT (user_data_is_type));
+      fpi_ssm_next_state (transfer->ssm);
+    }
 }
 
 /** Asynchroneous USB bulk write IN helper */
@@ -93,6 +101,7 @@ usb_read_in (FpDevice *dev,
              gsize length,
              gboolean short_is_error,
              guint timeout_in_ms,
+             GCancellable *cancellable,
              FpiUsbTransferCallback callback,
              gpointer user_data)
 {
@@ -110,7 +119,7 @@ usb_read_in (FpDevice *dev,
   transfer->short_is_error = short_is_error;
   transfer->ssm = ssm;
   fpi_usb_transfer_fill_bulk (transfer, CS9711_RECEIVE_ENDPOINT, length);
-  fpi_usb_transfer_submit (transfer, timeout_in_ms, NULL, callback, user_data);
+  fpi_usb_transfer_submit (transfer, timeout_in_ms, cancellable, callback, user_data);
 }
 
 /************************** INIT SSM *************************************/
@@ -166,52 +175,67 @@ enum {
   M_INIT_STATE_COUNT,
 };
 
+static void
+m_init_send_query_cb (FpiUsbTransfer *transfer,
+                      FpDevice       *dev,
+                      gpointer        user_data_is_type,
+                      GError         *error)
+{
+  if (error)
+    {
+      fp_dbg("Error details: '%s', quark: %u code: %d", error->message, error->domain, error->code);
+      // if (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
+      if (error->code == G_USB_DEVICE_ERROR_TIMED_OUT && error->domain == G_USB_DEVICE_ERROR)
+        {
+          g_error_free (error);
+          fpi_ssm_next_state (transfer->ssm);
+        }
+      else
+        fpi_ssm_mark_failed (transfer->ssm, error);
+    }
+  else
+    {
+      fp_dbg("Sent command 0x%X", GPOINTER_TO_UINT (user_data_is_type));
+      fpi_ssm_jump_to_state (transfer->ssm, M_INIT_STATE_RECEIVE_STATUS);
+    }
+}
+
 /* Exec init sequential state machine */
 static void
 m_init_state (FpiSsm *ssm, FpDevice *_dev)
 {
   FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (_dev);
-  GError *error = NULL;
 
+  /* The init transfers are short and not cancellable, cancelling one while the
+   * reader replies leaves the reply behind for the next read. A cancellation
+   * is handled once init is done, see m_init_complete. */
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case M_INIT_STATE_SEND_INI_QUERY:
-      usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_INIT, &error);
-      if (error)
-        {
-          fp_dbg("Error details: '%s', quark: %u code: %d", error->message, error->domain, error->code);
-          // if (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
-          if (error->code == G_USB_DEVICE_ERROR_TIMED_OUT && error->domain == G_USB_DEVICE_ERROR)
-            fpi_ssm_next_state (ssm);
-          else
-            fpi_ssm_mark_failed (ssm, error);
-        }
-      else
-        fpi_ssm_jump_to_state (ssm, M_INIT_STATE_RECEIVE_STATUS);
+      usb_send_out (_dev, ssm, CS9711_FP_CMD_TYPE_INIT, m_init_send_query_cb);
       break;
 
     case M_INIT_STATE_RECOVER_READ_IGNORED:
       fp_warn("Send operation had a timeout. Switching to reset procedure. Ignore next message about the result not matching the expected data.");
-      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, FALSE, CS9711_DEFAULT_WAIT_TIMEOUT, m_init_read_cb_check_expected, NULL);
+      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, FALSE, CS9711_DEFAULT_WAIT_TIMEOUT, NULL, m_init_read_cb_check_expected, NULL);
       break;
 
     case M_INIT_STATE_RECOVER_SEND_RESET:
-      usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_RESET, &error);
-      m_util_fail_if_error_or_next (ssm, error);
+      usb_send_out (_dev, ssm, CS9711_FP_CMD_TYPE_RESET, m_util_send_cb_fail_or_next);
       break;
 
     case M_INIT_STATE_RECOVER_READ_IGNORED_RESET:
       fp_warn("Send operation had a timeout. Switching to reset procedure.");
-      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, FALSE, CS9711_DEFAULT_WAIT_TIMEOUT, m_init_read_cb_check_expected, self);
+      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, FALSE, CS9711_DEFAULT_WAIT_TIMEOUT, NULL, m_init_read_cb_check_expected, self);
       break;
 
     case M_INIT_STATE_RECOVER_SEND_INIT:
-      usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_INIT, &error); // Do not reuse state to only try reset once
-      m_util_fail_if_error_or_next (ssm, error);
+      // Do not reuse state to only try reset once
+      usb_send_out (_dev, ssm, CS9711_FP_CMD_TYPE_INIT, m_util_send_cb_fail_or_next);
       break;
 
     case M_INIT_STATE_RECEIVE_STATUS:
-      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, TRUE, CS9711_DEFAULT_WAIT_TIMEOUT, m_init_read_cb_check_expected, NULL);
+      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, TRUE, CS9711_DEFAULT_WAIT_TIMEOUT, NULL, m_init_read_cb_check_expected, NULL);
       break;
 
     default:
@@ -222,10 +246,43 @@ m_init_state (FpiSsm *ssm, FpDevice *_dev)
   // fpi_ssm_mark_completed (ssm);
 }
 
+static void
+m_init_cancel_reset_cb (FpiUsbTransfer *transfer,
+                        FpDevice       *dev,
+                        gpointer        user_data_is_type,
+                        GError         *error)
+{
+  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
+
+  if (error)
+    {
+      g_warning ("Error while resetting after cancelled activation: %s", error->message);
+      g_error_free (error);
+    }
+  else
+    fp_dbg ("Reset reader after cancelled activation");
+
+  self->needs_reset = FALSE;
+  fpi_image_device_activate_complete (FP_IMAGE_DEVICE (dev), g_steal_pointer (&self->scan_error));
+}
+
 /* Complete init sequential state machine */
 static void
 m_init_complete (FpiSsm *ssm, FpDevice *dev, GError *error) //TODO: done
 {
+  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
+
+  if (!error)
+    self->needs_reset = TRUE;
+
+  /* libfprint ignores a cancellation while the device is activating */
+  if (!error && fpi_device_action_is_cancelled (dev))
+    {
+      self->scan_error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED, "Cancelled while activating");
+      usb_send_out (dev, NULL, CS9711_FP_CMD_TYPE_RESET, m_init_cancel_reset_cb);
+      return;
+    }
+
   fpi_image_device_activate_complete (FP_IMAGE_DEVICE (dev), error);
 }
 
@@ -233,8 +290,7 @@ m_init_complete (FpiSsm *ssm, FpDevice *dev, GError *error) //TODO: done
 
 enum {
   M_SCAN_INIT_SLEEP = 0,
-  M_SCAN_INIT_READ,
-  M_SCAN_WAIT_FOR_READ_TO_COMPLETE,
+  M_SCAN_START_CAPTURE,
   M_SCAN_GET_IMAGE_TAIL,
   M_SCAN_SEND_POST_SCAN,
   M_SCAN_IMAGE_COMPLETE,
@@ -243,6 +299,31 @@ enum {
 
 static const gpointer M_SCAN_READ_CB_BULK_UD_FIRST_BLOCK = (gpointer)1;
 static const gpointer M_SCAN_READ_CB_BULK_UD_SECOND_BLOCK = (gpointer)2;
+
+/* The image read has to be queued before the scan command is sent, so both are
+ * in flight together. Only move on once both completed, so that the ssm is never
+ * freed while one of them can still call back into it. */
+static void
+m_scan_capture_join (FpiSsm *ssm, FpDeviceCs9711 *self, GError *error)
+{
+  if (error)
+    {
+      if (self->scan_error)
+        g_error_free (error);
+      else
+        self->scan_error = error;
+      /* The image read has no timeout, make sure it ends too */
+      g_cancellable_cancel (self->scan_cancellable);
+    }
+
+  if (--self->scan_pending > 0)
+    return;
+
+  if (self->scan_error)
+    fpi_ssm_mark_failed (ssm, g_steal_pointer (&self->scan_error));
+  else
+    fpi_ssm_next_state (ssm);
+}
 
 /* Read into FpDeviceCs9711->image_buffer if one of the two expected chunk sizes */
 static void
@@ -279,7 +360,6 @@ m_scan_read_cb_bulk (FpiUsbTransfer *transfer,
   if (error)
     {
       fp_err ("Read failed: %s, aborting", error->message);
-      fpi_ssm_mark_failed (transfer->ssm, error);
     }
   else
     {
@@ -287,13 +367,18 @@ m_scan_read_cb_bulk (FpiUsbTransfer *transfer,
         {
           fp_dbg("\tSkipping buffer print - got %lu bytes, expected %lu", transfer->actual_length, expected_size);
           error = g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID, "expected %lu bytes but got %lu, can't continue", expected_size, transfer->actual_length);
-          fpi_ssm_mark_failed (transfer->ssm, error);
         }
       else {
         memcpy (offset, transfer->buffer, expected_size);
-        fpi_ssm_next_state (transfer->ssm);
       }
     }
+
+  if (user_data == M_SCAN_READ_CB_BULK_UD_FIRST_BLOCK)
+    m_scan_capture_join (transfer->ssm, self, error);
+  else if (error)
+    fpi_ssm_mark_failed (transfer->ssm, error);
+  else
+    fpi_ssm_next_state (transfer->ssm);
 }
 
 static int
@@ -321,12 +406,31 @@ m_scan_submit_image (FpiSsm        *ssm,
   return 0;
 }
 
+static void
+m_scan_send_scan_cb (FpiUsbTransfer *transfer,
+                     FpDevice       *dev,
+                     gpointer        user_data_is_type,
+                     GError         *error)
+{
+  if (error)
+    {
+      g_warning ("Error while sending command 0x%X: %s", GPOINTER_TO_UINT (user_data_is_type), error->message);
+    }
+  else
+    {
+      fp_dbg("Sent command 0x%X", GPOINTER_TO_UINT (user_data_is_type));
+      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
+    }
+
+  m_scan_capture_join (transfer->ssm, FPI_DEVICE_CS9711 (dev), error);
+}
+
 /* Exec scan sequential state machine */
 static void
 m_scan_state (FpiSsm *ssm, FpDevice *_dev)
 {
+  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (_dev);
   FpImageDevice *image_device = FP_IMAGE_DEVICE (_dev);
-  GError *error = NULL;
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
@@ -334,27 +438,24 @@ m_scan_state (FpiSsm *ssm, FpDevice *_dev)
       fpi_ssm_next_state_delayed (ssm, CS9711_DEFAULT_RESET_SLEEP);
       break;
 
-    case M_SCAN_INIT_READ:
-      usb_read_in (_dev, ssm, CS9711_FP_RECV_LEN_1, FALSE, 0, m_scan_read_cb_bulk, M_SCAN_READ_CB_BULK_UD_FIRST_BLOCK);
-      usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_SCAN, &error);
-      fpi_image_device_report_finger_status (image_device, TRUE);
-      m_util_fail_if_error_or_next (ssm, error);
-      break;
-
-    case M_SCAN_WAIT_FOR_READ_TO_COMPLETE:
-      /* Wait for usb_read_in's callback m_scan_read_cb_bulk to advance the state */
+    case M_SCAN_START_CAPTURE:
+      /* The read waits for a finger, no timeout. Both end in m_scan_capture_join. */
+      self->scan_pending = 2;
+      usb_read_in (_dev, ssm, CS9711_FP_RECV_LEN_1, FALSE, 0, self->scan_cancellable, m_scan_read_cb_bulk, M_SCAN_READ_CB_BULK_UD_FIRST_BLOCK);
+      usb_send_out (_dev, ssm, CS9711_FP_CMD_TYPE_SCAN, m_scan_send_scan_cb);
       break;
 
     case M_SCAN_GET_IMAGE_TAIL:
-      usb_read_in (_dev, ssm, CS9711_FP_RECV_LEN_2, TRUE, CS9711_DEFAULT_WAIT_TIMEOUT, m_scan_read_cb_bulk, M_SCAN_READ_CB_BULK_UD_SECOND_BLOCK);
+      usb_read_in (_dev, ssm, CS9711_FP_RECV_LEN_2, TRUE, CS9711_DEFAULT_WAIT_TIMEOUT, self->scan_cancellable, m_scan_read_cb_bulk, M_SCAN_READ_CB_BULK_UD_SECOND_BLOCK);
       break;
 
     case M_SCAN_SEND_POST_SCAN:
-      usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_RESET, &error);
-      m_util_fail_if_error_or_next (ssm, error);
+      usb_send_out (_dev, ssm, CS9711_FP_CMD_TYPE_RESET, m_util_send_cb_fail_or_next);
       break;
 
     case M_SCAN_IMAGE_COMPLETE:
+      /* The post scan reset was sent */
+      self->needs_reset = FALSE;
       m_scan_submit_image (ssm, image_device);
       fpi_image_device_report_finger_status (image_device, FALSE);
       fpi_ssm_mark_completed (ssm);
@@ -378,24 +479,119 @@ dev_activate (FpImageDevice *dev)
   fpi_ssm_start (ssm, m_init_complete);
 }
 
+/* Complete scan sequential state machine */
+static void
+m_scan_finish (FpDevice *dev, GError *error)
+{
+  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
+
+  self->scan_resetting = FALSE;
+  g_clear_object (&self->scan_cancellable);
+
+  if (self->deactivating)
+    {
+      /* Errors are expected here, the scan was stopped on purpose */
+      g_clear_error (&error);
+      self->deactivating = FALSE;
+      fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (dev), NULL);
+      return;
+    }
+
+  /* Let libfprint end the action instead of waiting for a finger forever */
+  if (error)
+    fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
+}
+
+static void
+m_scan_abort_reset_cb (FpiUsbTransfer *transfer,
+                       FpDevice       *dev,
+                       gpointer        user_data_is_type,
+                       GError         *error)
+{
+  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
+
+  if (error)
+    {
+      g_warning ("Error while resetting aborted scan: %s", error->message);
+      g_error_free (error);
+    }
+  else
+    fp_dbg ("Reset reader after aborted scan");
+
+  self->needs_reset = FALSE;
+  m_scan_finish (dev, g_steal_pointer (&self->scan_error));
+}
+
+/* Complete scan sequential state machine */
+static void
+m_scan_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
+
+  /* The ssm is freed after this callback */
+  self->scan_ssm = NULL;
+
+  /* A normal capture ends with the post scan reset. The reader stops sending
+   * images if an aborted scan (or one stopped during the initial sleep) skips it,
+   * so send it here, not cancellable since the scan cancellable may have aborted it. */
+  if (self->needs_reset)
+    {
+      self->scan_resetting = TRUE;
+      self->scan_error = error;
+      usb_send_out (dev, NULL, CS9711_FP_CMD_TYPE_RESET, m_scan_abort_reset_cb);
+      return;
+    }
+
+  m_scan_finish (dev, error);
+}
+
 /* Deactivate device */
 static void
 dev_deactivate (FpImageDevice *dev)
 {
-  fpi_image_device_deactivate_complete (dev, NULL);
+  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
+
+  if (self->scan_resetting)
+    {
+      /* m_scan_finish completes the deactivation once the reset is done */
+      self->deactivating = TRUE;
+      return;
+    }
+
+  if (!self->scan_ssm)
+    {
+      fpi_image_device_deactivate_complete (dev, NULL);
+      return;
+    }
+
+  /* Report completion only once the scan has really stopped, otherwise it
+   * keeps talking to the device after libfprint considers it inactive. */
+  self->deactivating = TRUE;
+  if (fpi_ssm_get_cur_state (self->scan_ssm) == M_SCAN_INIT_SLEEP)
+    {
+      /* Nothing in flight yet, only the delayed state change */
+      fpi_ssm_cancel_delayed_state_change (self->scan_ssm);
+      fpi_ssm_mark_completed (self->scan_ssm);
+    }
+  else
+    {
+      /* A transfer is pending, its callback fails the ssm */
+      g_cancellable_cancel (self->scan_cancellable);
+    }
 }
 
 static void
 dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
 {
-  FpiSsm *ssm_loop;
+  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
 
   if (state != FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON)
     return;
 
   /* Start a capture operation. */
-  ssm_loop = fpi_ssm_new (FP_DEVICE (dev), m_scan_state, M_SCAN_STATE_COUNT);
-  fpi_ssm_start (ssm_loop, NULL);
+  self->scan_cancellable = g_cancellable_new ();
+  self->scan_ssm = fpi_ssm_new (FP_DEVICE (dev), m_scan_state, M_SCAN_STATE_COUNT);
+  fpi_ssm_start (self->scan_ssm, m_scan_complete);
 }
 
 static void

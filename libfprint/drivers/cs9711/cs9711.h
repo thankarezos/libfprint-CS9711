@@ -34,6 +34,14 @@ struct _FpDeviceCs9711
 {
   FpImageDevice parent;
 
+  FpiSsm       *scan_ssm;
+  GCancellable *scan_cancellable;
+  gint          scan_pending;
+  GError       *scan_error;
+  gboolean      needs_reset;
+  gboolean      scan_resetting;
+  gboolean      deactivating;
+
   unsigned char image_buffer[CS9711_FRAME_SIZE];
 };
 
