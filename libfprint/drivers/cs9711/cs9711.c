@@ -552,6 +552,10 @@ fpi_device_cs9711_class_init (FpDeviceCs9711Class *klass)
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
   dev_class->nr_enroll_stages = 15;
+  /* The sensor waits for a finger in its own low-power detect mode after a
+   * scan command, so it can stay armed indefinitely. The vendor Windows
+   * driver keeps it armed for the whole time the lock screen is shown. */
+  dev_class->temp_hot_seconds = -1;
 
   img_class->algorithm = FPI_PRINT_SIGFM;
   img_class->img_open = dev_open;
