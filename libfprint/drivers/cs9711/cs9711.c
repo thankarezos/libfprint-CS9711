@@ -110,6 +110,7 @@ usb_read_in (FpDevice *dev,
              gsize length,
              gboolean short_is_error,
              guint timeout_in_ms,
+             GCancellable *cancellable,
              FpiUsbTransferCallback callback,
              gpointer user_data)
 {
@@ -127,8 +128,7 @@ usb_read_in (FpDevice *dev,
   transfer->short_is_error = short_is_error;
   transfer->ssm = ssm;
   fpi_usb_transfer_fill_bulk (transfer, CS9711_RECEIVE_ENDPOINT, length);
-  fpi_usb_transfer_submit (transfer, timeout_in_ms,
-                           fpi_device_get_cancellable (dev),
+  fpi_usb_transfer_submit (transfer, timeout_in_ms, cancellable,
                            callback, user_data);
 }
 
@@ -211,7 +211,7 @@ m_init_state (FpiSsm *ssm, FpDevice *_dev)
 
     case M_INIT_STATE_RECOVER_READ_IGNORED:
       fp_warn("Send operation had a timeout. Switching to reset procedure. Ignore next message about the result not matching the expected data.");
-      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, FALSE, CS9711_DEFAULT_WAIT_TIMEOUT, m_init_read_cb_check_expected, NULL);
+      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, FALSE, CS9711_DEFAULT_WAIT_TIMEOUT, NULL, m_init_read_cb_check_expected, NULL);
       break;
 
     case M_INIT_STATE_RECOVER_SEND_RESET:
@@ -221,7 +221,7 @@ m_init_state (FpiSsm *ssm, FpDevice *_dev)
 
     case M_INIT_STATE_RECOVER_READ_IGNORED_RESET:
       fp_warn("Send operation had a timeout. Switching to reset procedure.");
-      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, FALSE, CS9711_DEFAULT_WAIT_TIMEOUT, m_init_read_cb_check_expected, self);
+      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, FALSE, CS9711_DEFAULT_WAIT_TIMEOUT, NULL, m_init_read_cb_check_expected, self);
       break;
 
     case M_INIT_STATE_RECOVER_SEND_INIT:
@@ -230,7 +230,7 @@ m_init_state (FpiSsm *ssm, FpDevice *_dev)
       break;
 
     case M_INIT_STATE_RECEIVE_STATUS:
-      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, TRUE, CS9711_DEFAULT_WAIT_TIMEOUT, m_init_read_cb_check_expected, NULL);
+      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, TRUE, CS9711_DEFAULT_WAIT_TIMEOUT, NULL, m_init_read_cb_check_expected, NULL);
       break;
 
     default:
@@ -245,6 +245,11 @@ m_init_state (FpiSsm *ssm, FpDevice *_dev)
 static void
 m_init_complete (FpiSsm *ssm, FpDevice *dev, GError *error) //TODO: done
 {
+  /* libfprint ignores a cancellation while the device is activating */
+  if (!error && fpi_device_action_is_cancelled (dev))
+    error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                 "Cancelled while activating");
+
   fpi_image_device_activate_complete (FP_IMAGE_DEVICE (dev), error);
 }
 
@@ -372,7 +377,7 @@ m_scan_state (FpiSsm *ssm, FpDevice *_dev)
           break;
         }
 
-      usb_read_in (_dev, ssm, CS9711_FP_RECV_LEN_1, FALSE, 0, m_scan_read_cb_bulk, M_SCAN_READ_CB_BULK_UD_FIRST_BLOCK);
+      usb_read_in (_dev, ssm, CS9711_FP_RECV_LEN_1, FALSE, 0, fpi_device_get_cancellable (_dev), m_scan_read_cb_bulk, M_SCAN_READ_CB_BULK_UD_FIRST_BLOCK);
       usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_SCAN, &error);
       if (!error)
         {
@@ -387,7 +392,7 @@ m_scan_state (FpiSsm *ssm, FpDevice *_dev)
       break;
 
     case M_SCAN_GET_IMAGE_TAIL:
-      usb_read_in (_dev, ssm, CS9711_FP_RECV_LEN_2, TRUE, CS9711_DEFAULT_WAIT_TIMEOUT, m_scan_read_cb_bulk, M_SCAN_READ_CB_BULK_UD_SECOND_BLOCK);
+      usb_read_in (_dev, ssm, CS9711_FP_RECV_LEN_2, TRUE, CS9711_DEFAULT_WAIT_TIMEOUT, fpi_device_get_cancellable (_dev), m_scan_read_cb_bulk, M_SCAN_READ_CB_BULK_UD_SECOND_BLOCK);
       break;
 
     case M_SCAN_IMAGE_COMPLETE:
